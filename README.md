@@ -6,6 +6,10 @@ The models correspond to the manuscript:
 
 > Janis Kjell Witmer, Jonas Zbinden, Lucia Kleint, and Brandon Panos, *A Machine Learning Approach to Investigate the Evolution of Sunspots*.
 
+## Documentation notice
+
+This README and the documentation added to the source code were generated with the assistance of artificial intelligence. The underlying research methodology, scientific results, and original implementation remain the work of the authors. Users should consult the associated manuscript and review the source code when interpreting or reusing this repository.
+
 ## Scientific context
 
 The study uses observations from the Helioseismic and Magnetic Imager (HMI) aboard NASA's Solar Dynamics Observatory (SDO). The analyzed observables include:
@@ -21,24 +25,34 @@ The full methodology described in the paper has three stages:
 2. A hybrid ResNet18-Transformer model classifies fixed-length image sequences according to whether the active region later develops a sunspot.
 3. The trained sequence models are applied with a running window and combined in ensembles to produce time-resolved predictions.
 
-The repository contains image and sequence datasets, prediction smoothing, sequence construction, and the model architectures for the first two stages. Data acquisition, training, cross-validation, ensemble selection, and evaluation code are not currently included.
+The repository contains HMI data acquisition, image and sequence datasets, prediction smoothing, sequence construction, model architectures, and running-window ensemble selection. Model-training code is not currently included.
 
 ## Repository structure
 
 ```text
 Datasets/
 ├── Sequence_Dataset.py   # HDF5 sequence datasets and preprocessing
-└── Sunspots.py           # FITS image-level dataset
+└── Sunspots.py           # Labeled training and archive-wide image datasets
 Models/
 ├── Sunspot_Detection.py  # Image-level VGG/ResNet classifier
 └── Transformer.py        # CNN-Transformer sequence classifier
+data_pipeline.py       # Query JSOC and build the HMI HDF5 archive
 Sequence_Builder.py       # Build sequence descriptors from frame labels
+running_window_model_combination.py  # Select running-window ensembles
+running_window_inference.py  # Evaluate selected ensembles on validation data
 smoothing.py              # Smooth predictions and analyze label runs
 ```
 
+### `data_pipeline.py`
+
+Queries the definitive JSOC `hmi.sharp_cea_720s` series and can download the selected FITS segments into one HDF5 group per HARP. Its default query follows the paper: observations from 2013-11-14 through the end of 2023-04-18, with each active region's flux-weighted Stonyhurst longitude strictly between -70 and 70 degrees. It downloads the six analyzed image products (`continuum`, `magnetogram`, `Dopplergram`, `Br`, `Bp`, and `Bt`) plus `bitmap` and `conf_disambig`, which support masking and magnetic-field preprocessing.
+
 ### `Datasets/Sunspots.py`
 
-Defines `Sunspot_Dataset`, which reads 300 x 300 FITS files from `spot/` and `pore/` directories, optionally corrects limb darkening, standardizes the images, and applies rotational augmentation.
+Defines the two image-level datasets used in the labeling workflow:
+
+- `Manual_Labeled_Sunspot_Dataset` combines an existing dictionary of manual frame labels with images in the HMI HDF5 archive. Repeated annotations of a frame are averaged and thresholded at 0.5. It returns standardized, optionally rotated, three-channel images together with one-hot labels.
+- `Manual_Labeled_Sunspot_Dataset_Evaluation` enumerates every frame of a selected observable in the HDF5 archive for classifier inference. Despite its historical name, this class does not require or return manual labels. Its `look_up` attribute maps dataset indices back to HARP and frame indices.
 
 ### `Datasets/Sequence_Dataset.py`
 
@@ -72,6 +86,18 @@ Converts a dictionary of smoothed frame labels into positive and negative sequen
 
 Applies a centered moving-average window to frame-level class predictions and provides utilities for measuring consecutive label runs and selecting a smoothing-window size.
 
+### `running_window_model_combination.py`
+
+Evaluates running-window prediction models with the Brier score and searches non-empty model subsets for the best ensemble. For each model, it reconstructs the original five-fold split from the checkpoint's random seed and includes only active regions belonging to the selected training or validation split. Ensemble probabilities are averaged, while predictive uncertainty combines the mean within-model variance with the variance between model predictions.
+
+The script operates on predictions that have already been generated. It does not load the Transformer architectures or perform running-window model inference itself.
+
+### `running_window_inference.py`
+
+Loads the model subset and baseline selected by `running_window_model_combination.py`, reconstructs their held-out cross-validation folds, and evaluates the ensemble on validation HARPs. It saves index-aligned combined predictions and validation summaries in both PyTorch and CSV formats.
+
+Despite its filename, this script combines previously generated model outputs rather than executing the Transformer models. The running-window predictions must already exist in the HDF5 archive.
+
 ## Requirements
 
 - Python 3
@@ -79,8 +105,11 @@ Applies a centered moving-average window to frame-level class predictions and pr
 - torchvision
 - NumPy
 - h5py
-- SciPy
+- drms
 - Astropy
+- pandas
+- SciPy
+- scikit-learn
 - tqdm
 
 Install the core dependencies in a virtual environment:
@@ -88,7 +117,7 @@ Install the core dependencies in a virtual environment:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install torch torchvision numpy h5py scipy astropy tqdm
+python -m pip install torch torchvision numpy h5py drms astropy pandas scipy scikit-learn tqdm
 ```
 
 Exact package versions were not recorded in this repository. For reproducibility, record the versions used in future training runs.
@@ -96,6 +125,31 @@ Exact package versions were not recorded in this repository. For reproducibility
 ## Basic use
 
 Run commands from the repository root so imports such as `Models.Transformer` resolve correctly.
+
+Preview the paper-matched JSOC selection and its estimated size:
+
+```bash
+python data_pipeline.py
+```
+
+The generated DRMS record-set query is:
+
+```text
+hmi.sharp_cea_720s[][2013.11.14_00:00:00_TAI-2023.04.18_23:59:59_TAI][? LON_FWT > -70 AND LON_FWT < 70 ?]
+```
+
+The empty first selector includes every HARP, the second selector covers the paper's complete date interval, and the final selector applies the strict longitude bounds to each observation. `LON_FWT` is the Stonyhurst longitude of the line-of-sight flux-weighted center of the active patch.
+
+Downloading is deliberately opt-in because the manuscript reports a total size of approximately 7 TB:
+
+```bash
+python data_pipeline.py \
+  --download \
+  --output /path/to/hmi_active_regions.h5 \
+  --max-workers 8
+```
+
+The output parent directory is created automatically. Querying and downloading require network access to JSOC; an interrupted multi-terabyte download is not currently resumable.
 
 Create an image-level classifier:
 
@@ -151,23 +205,62 @@ model = Hybrid(
 
 The example sequence-model parameters reflect the architecture and optimal Transformer hyperparameters reported in the manuscript. Model construction may download pretrained torchvision weights if they are not already cached.
 
-Load the image-level FITS dataset:
+### Image-level labeling datasets
+
+The manually labeled data must already exist before constructing the training dataset. The repository does not create these annotations or include the label dictionary. In the paper, 1,000 continuum images from 595 active regions were manually labeled according to whether they contained a sunspot.
+
+The expected dictionary maps each HARP identifier to label records:
 
 ```python
-from Datasets.Sunspots import Sunspot_Dataset
-
-dataset = Sunspot_Dataset(data_dir="/path/to/SunspotPore_Data")
+manual_labels = {
+    "3386": [
+        (12, 0),          # frame 12 was labeled once as no sunspot
+        (45, 1),          # frame 45 was labeled once as sunspot
+        (78, 1, 1, 0),    # repeated labels are averaged and thresholded at 0.5
+    ],
+}
 ```
 
-The image directory must have this structure:
+The HARP keys must match groups in the HDF5 archive, and each frame index must be valid for the selected observable. Construct the labeled training dataset as follows:
 
-```text
-SunspotPore_Data/
-├── pore/
-│   └── *.fits
-└── spot/
-    └── *.fits
+```python
+import torch
+
+from Datasets.Sunspots import Manual_Labeled_Sunspot_Dataset
+
+manual_labels = torch.load(
+    "/path/to/manual_labels.pt",
+    map_location="cpu",
+    weights_only=False,
+)
+dataset = Manual_Labeled_Sunspot_Dataset(
+    labels=manual_labels,
+    data_path="/path/to/hmi_active_regions.h5",
+    type="continuum",
+    standardize=True,
+    augmentate=True,
+)
 ```
+
+Train/validation splitting is not performed by the dataset and must be applied separately. The paper uses 90% of the manually labeled images for training and 10% for validation. Training images are standardized to zero mean and unit variance and randomly rotated between -45 and 45 degrees; validation data should normally be constructed with `augmentate=False`.
+
+After training, use the evaluation dataset to enumerate all images in the HDF5 archive and generate model-based labels:
+
+```python
+from Datasets.Sunspots import Manual_Labeled_Sunspot_Dataset_Evaluation
+
+inference_dataset = Manual_Labeled_Sunspot_Dataset_Evaluation(
+    data_path="/path/to/hmi_active_regions.h5",
+    type="continuum",
+    standardize=True,
+    augmentate=False,
+)
+
+# Map a returned dataset index back to its source HARP and frame.
+harp, frame_index = inference_dataset.look_up[0]
+```
+
+This second dataset does not require the manual-label dictionary. It requires only the prepared HDF5 archive and is intended for applying the trained classifier to the remaining images.
 
 Load sequence data from HDF5:
 
@@ -185,7 +278,6 @@ dataset = Sequence_Dataset(
 Instead of passing paths to every dataset, they can be configured with environment variables:
 
 ```bash
-export SUNSPOT_IMAGE_DATA_DIR=/path/to/SunspotPore_Data
 export SUNSPOT_HDF5_PATH=/path/to/hmi_active_regions.h5
 export SUNSPOT_SEQUENCES_PATH=/path/to/sequences.pt
 ```
@@ -208,11 +300,55 @@ python smoothing.py \
   --threshold-hours 1 --max-window-hours 51.8
 ```
 
-Use `python Sequence_Builder.py --help` or `python smoothing.py --help` for all command-line options.
+Select a running-window ensemble on the training folds:
+
+```bash
+python running_window_model_combination.py \
+  /path/to/running_window_predictions.h5 \
+  /path/to/long_sequences.pt \
+  /path/to/fixed_sequence_labels \
+  /path/to/transformer_checkpoints \
+  /path/to/output \
+  --expected-sequences 509 \
+  --observable Continuum \
+  --prediction-group continuum \
+  --processes 8
+```
+
+The five positional paths are, in order:
+
+1. the HDF5 file containing previously generated running-window predictions;
+2. the running-window sequence descriptor file used as the reference;
+3. the directory containing fixed-length sequence files for each correction value;
+4. the directory tree containing the trained Transformer checkpoints; and
+5. the output directory for combined predictions and score summaries.
+
+`--prediction-group` must exactly match the observable group name in the prediction HDF5 file. If it is omitted, the value supplied through `--observable` is used. By default, model eligibility and scores are calculated from training HARPs; pass `--validation` to use the corresponding validation HARPs. The script also accepts `SLURM_ARRAY_TASK_ID`, `SLURM_CPUS_PER_TASK`, `EXPECTED_SEQUENCES`, and the legacy lowercase `expected_sequences` environment variable, but none of them is required when the equivalent command-line options are provided.
+
+The subset search grows exponentially with the number of candidate models. The paper evaluates all non-empty combinations of a preselected pool of 19 models per observable. The supplied HDF5 file should therefore contain only the intended candidate pool, and `--max-subset-size` can be used to limit the largest ensemble considered.
+
+Evaluate the selected ensemble on the held-out validation folds:
+
+```bash
+python running_window_inference.py \
+  /path/to/running_window_predictions.h5 \
+  /path/to/long_sequences.pt \
+  /path/to/fixed_sequence_labels \
+  /path/to/transformer_checkpoints \
+  /path/to/model_combination_output/Continuum/summary.pt \
+  /path/to/validation_output \
+  --expected-sequences 509 \
+  --observable Continuum \
+  --prediction-group continuum
+```
+
+The inference script reads the selected model tuple and training-selected baseline from the combination summary. It calculates both scores using only each model's validation HARPs, saves `validation_predictions.pt`, and writes `validation_summary.pt` and `validation_summary.csv`. Current summaries contain the baseline identity directly; summaries created by older versions are also supported, although finding the baseline then requires recalculating training scores.
+
+Use each script's `--help` option for its complete command-line reference.
 
 ## Data and preprocessing
 
-The manuscript uses the HMI `hmi.sharp_cea_720s` data series, with observations binned to a 12-minute cadence. The HDF5 file expected by `Sequence_Dataset` contains one group per HARP. Each group contains datasets named after the requested observables (for example, `continuum`, `Dopplergram`, `Br`, `Bp`, and `Bt`) and a `bitmap` dataset used during background correction.
+The manuscript uses the HMI `hmi.sharp_cea_720s` data series, whose records have a 12-minute cadence. The default query in `data_pipeline.py` implements the paper's time and longitude criteria. The resulting HDF5 file contains one group per HARP, with datasets named after the requested observables (`continuum`, `magnetogram`, `Dopplergram`, `Br`, `Bp`, and `Bt`) and auxiliary `bitmap` and `conf_disambig` masks.
 
 Sequence descriptor files are serialized lists of dictionaries with this structure:
 
@@ -226,6 +362,19 @@ Sequence descriptor files are serialized lists of dictionaries with this structu
 
 The implemented preprocessing includes modality-specific polynomial correction, normalization, downsampling, removal or replacement of invalid frames, rotations, and horizontal or vertical flips.
 
+The running-window prediction HDF5 file must use the following hierarchy:
+
+```text
+observable/
+└── correction/
+    └── model_name/
+        └── sequence_index/
+            ├── predictions
+            └── uncertainty
+```
+
+The last column of each `predictions` and `uncertainty` array is interpreted as the sunspot-class probability or uncertainty. Fixed-length sequence descriptor filenames must follow `Sequences_ws_23p8_corr_<correction>_filter_[15, 15].pt`. Each model filename must begin with its fold number and end in `.pth`; its checkpoint must contain `parameters.random_state` so the original five-fold split can be reconstructed.
+
 The original HMI observations are not redistributed here. Users are responsible for obtaining the data and complying with the source archive's terms and citation requirements.
 
 ## Reproducibility status
@@ -236,8 +385,8 @@ This is a partial research-code release. Dataset preprocessing and architecture 
 - trained model weights, which are not distributed through this GitHub repository;
 - the original observations or labeled datasets;
 - image-classifier inference and prediction-cleanup code;
-- training and cross-validation scripts; or
-- evaluation and running-window ensemble scripts.
+- training scripts; or
+- the code that initially generates the running-window prediction HDF5 archive.
 
 These limitations should be considered when reusing the models or comparing new results with the paper.
 
