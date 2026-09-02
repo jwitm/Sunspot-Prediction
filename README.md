@@ -403,8 +403,6 @@ If this code contributes to published work, please cite the associated manuscrip
 }
 ```
 
-Replace this provisional entry with the journal citation and DOI when they are available.
-
 ## License
 
 No license file is currently included. Until a license is added, copyright remains with the authors and reuse permissions are not explicitly granted.
